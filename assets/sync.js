@@ -45,9 +45,13 @@ export function unb64(s) {
 
 async function api(cfg, method, path, body) {
   let res;
+  // GitHub API 的 GET 带 Cache-Control: private, max-age=60，
+  // 不绕开的话会拿到一分钟前的旧文件，sha 也是旧的 → 误判冲突 / 409。
+  const url = API + path + (method === 'GET' ? (path.includes('?') ? '&' : '?') + '_=' + Date.now() : '');
   try {
-    res = await fetch(API + path, {
+    res = await fetch(url, {
       method,
+      cache: 'no-store',
       headers: {
         Authorization: `Bearer ${cfg.token}`,
         Accept: 'application/vnd.github+json',

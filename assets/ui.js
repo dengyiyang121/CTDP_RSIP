@@ -7,7 +7,7 @@ import { layoutTree, edgePath } from './tree.js';
 import * as S from './sound.js';
 import * as G from './sync.js';
 
-const APP_VERSION = '0.4.0';
+const APP_VERSION = '0.4.1';
 
 /* ---------------- 元素 ---------------- */
 const $ = (s, r = document) => r.querySelector(s);
@@ -104,13 +104,29 @@ function rescheduleAll() {
 
 let syncCfg = G.loadCfg();
 let syncTimer = null;
+let syncBusy = false;
 let syncConflict = false;
+let lastAutoWarn = 0;
 
-const syncInfo = () => st.sync || { sha: null, at: 0, rev: 0 };
-const isDirty = () => (st.rev || 0) > (syncInfo().rev || 0);
+const syncInfo = () => st.sync || { sha: null, at: 0, rev: 0, digest: '' };
+
+/** 内容指纹：不含 sync 字段，用来判断“本机是否真的改过” */
+function digestOf(s) {
+  return C.fnv1a(JSON.stringify({ ...s, sync: null }));
+}
+const localDigest = () => digestOf(st);
+const isDirty = () => localDigest() !== (syncInfo().digest || '');
+
+/** 远端指纹必须先把状态跑一遍规范化，否则和本地永远对不上 */
+function remoteDigest(text) {
+  const obj = JSON.parse(text);
+  if (!obj || obj.app !== C.APP_ID) throw new Error('云端文件不是本应用的账本');
+  const fresh = C.Ledger.load(JSON.stringify(obj), { save: null });
+  return { digest: digestOf(fresh.state), state: fresh.state };
+}
 
 function markSynced(sha) {
-  st.sync = { sha, at: Date.now(), rev: st.rev || 0 };
+  st.sync = { sha, at: Date.now(), rev: st.rev || 0, digest: localDigest() };
   led.save();
 }
 
@@ -136,7 +152,7 @@ function applyRemote(text, sha) {
   const fresh = C.Ledger.load(JSON.stringify(obj), { save: led._save });
   led.state = fresh.state;
   st = led.state;
-  st.sync = { sha, at: Date.now(), rev: st.rev || 0 };
+  st.sync = { sha, at: Date.now(), rev: st.rev || 0, digest: digestOf(st) };
   led.save();
   syncConflict = false;
   render();
@@ -150,16 +166,16 @@ async function doPull({ silent = false, force = false } = {}) {
       if (!silent) toast('云端还没有文件，先「上传」一次');
       return false;
     }
-    const revRemote = (() => {
-      try {
-        return JSON.parse(remote.text).rev || 0;
-      } catch (e) {
-        return -1;
-      }
-    })();
-    if (!force && revRemote <= (st.rev || 0)) {
+    let remoteState;
+    try {
+      remoteState = JSON.parse(remote.text);
+    } catch (e) {
+      throw new Error('云端文件不是合法 JSON');
+    }
+    if (!remoteState || remoteState.app !== C.APP_ID) throw new Error('云端文件不是本应用的账本');
+    if (!force && remoteDigest(remote.text).digest === localDigest()) {
       markSynced(remote.sha);
-      if (!silent) toast('云端没有更新的版本');
+      if (!silent) toast('云端和本机一致');
       render();
       return true;
     }
@@ -175,13 +191,13 @@ async function doPull({ silent = false, force = false } = {}) {
 async function doPush({ silent = false, force = false } = {}) {
   if (!G.configured(syncCfg)) return false;
   try {
-    const info = syncInfo();
-    let res = await G.push(syncCfg, JSON.stringify(st), info.sha, `账本 ${new Date().toLocaleString('zh-CN')}`);
-    if (res.conflict && force) {
-      // 显式“上传本机”时，用远端当前 sha 再推一次
+    let sha = syncInfo().sha;
+    if (force) {
+      // 显式覆盖时先取当前 sha，别拿旧的去撞 409
       const remote = await G.pull(syncCfg);
-      res = await G.push(syncCfg, JSON.stringify(st), remote ? remote.sha : null, '账本（覆盖云端）');
+      sha = remote ? remote.sha : null;
     }
+    const res = await G.push(syncCfg, JSON.stringify(st), sha, `账本 ${new Date().toLocaleString('zh-CN')}`);
     if (res.conflict) {
       syncConflict = true;
       if (!silent) toast('云端已经变了，先拉取对比');
@@ -235,19 +251,116 @@ function applySyncHash() {
 }
 
 /** 改动后 20 秒自动推一次；开机时若本地干净就自动拉 */
+/** 两边都动过：别猜，等人选 */
+function flagConflict(manual) {
+  syncConflict = true;
+  render();
+  const now = Date.now();
+  if (manual || now - lastAutoWarn > 60000) {
+    lastAutoWarn = now;
+    toast('云端和本机都改过，同步暂停了');
+  }
+  return false;
+}
+
+/**
+ * 三方比较：本机 == 上次同步？云端 == 上次同步？
+ * 只有一边动过就自动同步；两边都动过就停下来等人选。
+ */
+async function syncNow({ manual = false } = {}) {
+  if (!G.configured(syncCfg) || syncBusy) return false;
+  syncBusy = true;
+  try {
+    const remote = await G.pull(syncCfg);
+    const local = localDigest();
+    const seen = syncInfo().digest || '';
+
+    if (!remote) return await doPush({ silent: !manual, force: true });
+
+    let remoteState;
+    try {
+      remoteState = JSON.parse(remote.text);
+    } catch (e) {
+      throw new Error('云端文件不是合法 JSON');
+    }
+    if (!remoteState || remoteState.app !== C.APP_ID) throw new Error('云端文件不是本应用的账本');
+
+    const rd = remoteDigest(remote.text).digest;
+
+    if (rd === local) {
+      markSynced(remote.sha);
+      syncConflict = false;
+      render();
+      return true;
+    }
+    if (!seen) {
+      // 全新设备（几乎没动过）直接接云端；动过就别猜
+      const fresh = (st.events || []).length <= 1 && !st.wins.length && !st.precedents.length;
+      if (fresh) {
+        applyRemote(remote.text, remote.sha);
+        if (manual) toast('已拉取云端账本');
+        return true;
+      }
+      return flagConflict(manual);
+    }
+    if (local === seen) {
+      applyRemote(remote.text, remote.sha);
+      if (manual) toast('已拉取云端账本');
+      return true;
+    }
+    if (rd === seen) return await doPush({ silent: !manual });
+    return flagConflict(manual);
+  } catch (e) {
+    if (manual) toast(e.message || '同步失败');
+    return false;
+  } finally {
+    syncBusy = false;
+  }
+}
+
+/** 冲突时的一键合并：只对“只会增加”的集合取并集 */
+function mergeRemote(text) {
+  const remote = JSON.parse(text);
+  const union = (a, b) => {
+    const ids = new Set(a.map((x) => x.id));
+    return [...a, ...(b || []).filter((x) => !ids.has(x.id))];
+  };
+  st.precedents = union(st.precedents, remote.precedents);
+  st.wins = union(st.wins, remote.wins);
+  for (const rc of remote.chains || []) {
+    const lc = st.chains.find((c) => c.id === rc.id);
+    if (!lc) st.chains.push(rc);
+    else if ((rc.nodes || []).length > (lc.nodes || []).length) {
+      lc.nodes = rc.nodes;
+      lc.resets = rc.resets || lc.resets;
+    }
+  }
+  led.save();
+  render();
+}
+
 function autoSyncSoon() {
   if (!G.configured(syncCfg)) return;
   clearTimeout(syncTimer);
-  syncTimer = setTimeout(() => {
-    if (G.configured(syncCfg) && isDirty() && !syncConflict) doPush({ silent: true });
-  }, 20000);
+  syncTimer = setTimeout(() => syncNow({}), 8000);
 }
 
 async function bootSync() {
   if (!G.configured(syncCfg)) return;
-  if (!isDirty()) await doPull({ silent: true });
+  await syncNow({});
   rescheduleAll();
 }
+
+/* 回到前台、恢复联网、以及每 45 秒都试一次 */
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && G.configured(syncCfg)) syncNow({});
+});
+window.addEventListener('online', () => {
+  if (G.configured(syncCfg)) syncNow({});
+});
+setInterval(() => {
+  if (document.visibilityState === 'visible' && G.configured(syncCfg) && !syncBusy) syncNow({});
+}, 45000);
 
 let toastTimer = null;
 let flashTimer = null;
@@ -485,6 +598,14 @@ function viewChains() {
                <span>今日尚未结算。国策不会自动灭，也不会自动变好。</span>
                <button class="btn" data-act="settle">结算</button>
              </div>`
+      }
+      ${
+        syncConflict
+          ? `<div class="warn" style="margin-top:10px;display:flex;gap:12px;align-items:center;justify-content:space-between">
+               <span>云端和本机都改过，自动同步暂停。</span>
+               <button class="btn" data-act="sync-conflict">处理</button>
+             </div>`
+          : ''
       }
     </section>`;
 
@@ -741,6 +862,11 @@ function viewArchive() {
     <section class="section">
       <div class="sec-head">云同步<span class="spacer"></span><span class="hint">${G.configured(syncCfg) ? '已配置' : '未配置'}</span></div>
       <div class="note">${esc(syncLine())}</div>
+      ${
+        syncConflict
+          ? `<div class="btnrow" style="margin-top:10px"><button class="btn danger wide" data-act="sync-conflict">处理冲突</button></div>`
+          : ''
+      }
       <div class="btnrow" style="margin-top:10px">
         <button class="btn" data-act="sync-pull" ${G.configured(syncCfg) ? '' : 'disabled'}>拉取</button>
         <button class="btn" data-act="sync-push" ${G.configured(syncCfg) ? '' : 'disabled'}>上传</button>
@@ -1463,6 +1589,27 @@ function openSettings() {
   });
 }
 
+function openConflict() {
+  openSheet({
+    title: '云端和本机都改过',
+    body: `
+      <p class="tip" style="margin-top:0">两边都有新内容，自动同步先停住了。选一边覆盖，或者合并。</p>
+      <div class="note" style="font-size:13px">
+        合并＝判例、喜报取并集；同一条链保留节点更多的那份；国策树以本机为准。
+      </div>
+      <div class="btnrow" style="margin-top:12px">
+        <button class="btn primary wide" data-act="sync-push-force">用本机覆盖云端</button>
+      </div>
+      <div class="btnrow">
+        <button class="btn wide" data-act="sync-pull-force">用云端覆盖本机</button>
+      </div>
+      <div class="btnrow">
+        <button class="btn wide" data-act="sync-merge">合并两边</button>
+      </div>
+      <div class="btnrow"><button class="btn ghost wide" data-act="close">先不动</button></div>`,
+  });
+}
+
 function openSync() {
   const c = syncCfg;
   const link = c.repo ? `https://github.com/${c.repo}/blob/${c.branch}/${c.path}` : '';
@@ -1970,6 +2117,28 @@ function onClick(e) {
     case 'sync-open':
       openSync();
       break;
+    case 'sync-conflict':
+      openConflict();
+      break;
+    case 'sync-merge': {
+      closeSheet();
+      (async () => {
+        try {
+          const remote = await G.pull(syncCfg);
+          if (!remote) return toast('云端没有文件');
+          mergeRemote(remote.text);
+          const ok = await doPush({ force: true });
+          if (ok) {
+            syncConflict = false;
+            render();
+            toast('已合并并上传');
+          }
+        } catch (e) {
+          toast(e.message || '合并失败');
+        }
+      })();
+      break;
+    }
     case 'sync-save': {
       const cfg = {
         repo: $('#sy-repo').value.trim().replace(/^https?:\/\/github\.com\//, '').replace(/\.git$/, ''),
@@ -2082,6 +2251,9 @@ window.__app = {
   state: () => led.state,
   sound: S,
   sync: G,
+  syncNow,
+  syncLine,
+  isDirty,
 };
 
 /* ---------------- 启动 ---------------- */
