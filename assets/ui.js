@@ -172,11 +172,16 @@ async function doPull({ silent = false, force = false } = {}) {
   }
 }
 
-async function doPush({ silent = false } = {}) {
+async function doPush({ silent = false, force = false } = {}) {
   if (!G.configured(syncCfg)) return false;
   try {
     const info = syncInfo();
-    const res = await G.push(syncCfg, JSON.stringify(st), info.sha, `账本 ${new Date().toLocaleString('zh-CN')}`);
+    let res = await G.push(syncCfg, JSON.stringify(st), info.sha, `账本 ${new Date().toLocaleString('zh-CN')}`);
+    if (res.conflict && force) {
+      // 显式“上传本机”时，用远端当前 sha 再推一次
+      const remote = await G.pull(syncCfg);
+      res = await G.push(syncCfg, JSON.stringify(st), remote ? remote.sha : null, '账本（覆盖云端）');
+    }
     if (res.conflict) {
       syncConflict = true;
       if (!silent) toast('云端已经变了，先拉取对比');
@@ -190,6 +195,41 @@ async function doPush({ silent = false } = {}) {
     return true;
   } catch (e) {
     if (!silent) toast(e.message || '上传失败');
+    return false;
+  }
+}
+
+/** 用 #sync=<base64url>&mode=push|pull 一条链接完成配置（片段不会发到服务器） */
+function b64urlDecode(s) {
+  const b = s.replace(/-/g, '+').replace(/_/g, '/');
+  const pad = b.length % 4 ? '='.repeat(4 - (b.length % 4)) : '';
+  const bin = atob(b + pad);
+  const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0));
+  return new TextDecoder().decode(bytes);
+}
+
+function applySyncHash() {
+  const hash = location.hash || '';
+  const m = /[#&]sync=([A-Za-z0-9_-]+)/.exec(hash);
+  if (!m) return false;
+  try {
+    const cfg = JSON.parse(b64urlDecode(m[1]));
+    if (!cfg || !cfg.repo || !cfg.token) throw new Error('bad');
+    G.saveCfg({ ...G.DEF, ...cfg });
+    syncCfg = G.loadCfg();
+    const mode = /[#&]mode=(push|pull)/.exec(hash);
+    history.replaceState(null, '', location.pathname + location.search);
+    render();
+    toast(`云同步已配置：${cfg.repo}`);
+    if (mode) {
+      setTimeout(() => {
+        if (mode[1] === 'push') doPush({ force: true });
+        else doPull({});
+      }, 600);
+    }
+    return true;
+  } catch (e) {
+    toast('配置链接无效');
     return false;
   }
 }
@@ -2056,7 +2096,8 @@ if (!st.seen) {
   navigator.storage.persist().catch(() => {});
 }
 
-bootSync();
+const hashApplied = applySyncHash();
+if (!hashApplied) bootSync();
 setTimeout(() => {
   if (G.configured(syncCfg)) autoSyncSoon();
 }, 3000);
