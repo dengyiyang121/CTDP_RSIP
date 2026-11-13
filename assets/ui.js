@@ -2036,6 +2036,14 @@ function onClick(e) {
 
 document.addEventListener('click', onClick);
 
+/* 调试出口：出问题时在控制台看一眼版本 / 音频状态 / 状态对象 */
+window.__app = {
+  version: APP_VERSION,
+  state: () => led.state,
+  sound: S,
+  sync: G,
+};
+
 /* ---------------- 启动 ---------------- */
 
 paintEmblem();

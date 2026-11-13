@@ -73,6 +73,7 @@ export function blankState() {
     wins: [],
     events: [],
     lastPolicyDay: null,
+    sync: { sha: null, at: 0, rev: 0 },
     seen: false,
   };
 }
