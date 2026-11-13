@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#12120e">
+<meta name="description" content="链式时延协议与递归稳态迭代协议的本地账本">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="作战档案">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="mobile-web-app-capable" content="yes">
+<title>作战档案 · CTDP / RSIP</title>
+<link rel="manifest" href="./manifest.webmanifest">
+<link rel="icon" href="./assets/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="./assets/icon-192.png">
+<link rel="stylesheet" href="./assets/style.css?v=4">
+</head>
+<body>
+
+<div id="app">
+  <header class="masthead">
+    <svg class="emblem" id="emblem" viewBox="0 0 11 12" width="26" height="28"
+         shape-rendering="crispEdges" aria-hidden="true" focusable="false"></svg>
+    <div>
+      <h1>作战档案</h1>
+      <p class="sub">CTDP<span class="sep">/</span>RSIP<span class="sep">·</span>本地终端<span class="sep">·</span>离线可用</p>
+    </div>
+    <div class="stamp-wrap">
+      <span class="date mono" id="today">—</span>
+      <span class="seal" id="seal" title="账本哈希链状态">完整</span>
+    </div>
+  </header>
+
+  <nav class="tabs" role="tablist" aria-label="主导航">
+    <button role="tab" id="tab-chains" data-tab="chains" aria-selected="true" aria-controls="view">主链</button>
+    <button role="tab" id="tab-policies" data-tab="policies" aria-selected="false" aria-controls="view">国策树</button>
+    <button role="tab" id="tab-precedents" data-tab="precedents" aria-selected="false" aria-controls="view">判例</button>
+    <button role="tab" id="tab-archive" data-tab="archive" aria-selected="false" aria-controls="view">档案</button>
+  </nav>
+
+  <main id="view" tabindex="-1"></main>
+</div>
+
+<footer class="dock" id="dockwrap" hidden>
+  <div class="dock-inner" id="dock"></div>
+</footer>
+
+<div class="overlay" id="overlay" hidden>
+  <div class="sheet" id="sheet" role="dialog" aria-modal="true" aria-labelledby="sheet-title"></div>
+</div>
+
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+<script type="module" src="./assets/ui.js?v=4"></script>
+</body>
+</html>
