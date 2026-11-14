@@ -7,7 +7,7 @@ import { layoutTree, edgePath } from './tree.js';
 import * as S from './sound.js';
 import * as G from './sync.js';
 
-const APP_VERSION = '0.4.1';
+const APP_VERSION = '0.4.2';
 
 /* ---------------- 元素 ---------------- */
 const $ = (s, r = document) => r.querySelector(s);
@@ -349,6 +349,11 @@ async function bootSync() {
   if (!G.configured(syncCfg)) return;
   await syncNow({});
   rescheduleAll();
+  if (syncConflict && els.overlay.hidden) {
+    setTimeout(() => {
+      if (syncConflict) openConflict();
+    }, 700);
+  }
 }
 
 /* 回到前台、恢复联网、以及每 45 秒都试一次 */
@@ -575,6 +580,33 @@ function chainCard(c, now) {
   </article>`;
 }
 
+/** 主链顶部的同步状态条：一眼能看到“有没有上传” */
+function syncBar() {
+  if (!G.configured(syncCfg)) return '';
+  const info = syncInfo();
+  let cls = 'ok';
+  let text = `已同步 · ${C.fmtHM(info.at)}`;
+  let act = 'sync-open';
+  if (syncConflict) {
+    cls = 'warn';
+    text = '两边都改过 · 去处理';
+    act = 'sync-conflict';
+  } else if (!info.at) {
+    cls = 'dirty';
+    text = '还没同步过 · 立即上传';
+    act = 'sync-push';
+  } else if (isDirty()) {
+    cls = 'dirty';
+    text = '有改动未上传 · 立即上传';
+    act = 'sync-push';
+  }
+  return `<button class="syncbar ${cls}" data-act="${act}">
+    <span class="sdot" aria-hidden="true"></span>
+    <span class="stxt">${esc(text)}</span>
+    <span class="sar" aria-hidden="true">›</span>
+  </button>`;
+}
+
 function viewChains() {
   const now = Date.now();
   const today = C.dayKey(now, st.settings.dayStart);
@@ -613,7 +645,7 @@ function viewChains() {
     ? st.chains.map((c) => chainCard(c, now)).join('')
     : `<div class="empty">还没有链。<br>一条链 = 一个锚点 + 一小时。</div>`;
 
-  return `${hero}
+  return `${syncBar()}${hero}
     <section class="section">
       <div class="sec-head">主链<span class="spacer"></span><span class="hint">${st.chains.length} 条</span></div>
       ${list}
@@ -1641,9 +1673,69 @@ function openSync() {
       </div>
       ${
         G.configured(c)
+          ? `<div class="btnrow"><button class="btn wide" data-act="sync-diag">同步体检（看两边差在哪）</button></div>`
+          : ''
+      }
+      ${
+        G.configured(c)
           ? `<div class="btnrow"><button class="btn ghost wide" data-act="sync-forget">清除配置（账本不动）</button></div>`
           : ''
       }`,
+  });
+}
+
+/** 体检：把本机 / 上次同步 / 云端 三个指纹摆出来，并给出下一步 */
+async function syncDiag() {
+  if (!G.configured(syncCfg)) return toast('先配置云同步');
+  let remote = null;
+  let rd = '';
+  try {
+    remote = await G.pull(syncCfg);
+    if (remote) rd = remoteDigest(remote.text).digest;
+  } catch (e) {
+    return toast(e.message || '拉不到云端');
+  }
+  const local = localDigest();
+  const seen = syncInfo().digest || '';
+
+  let verdict;
+  let actions;
+  if (!remote) {
+    verdict = '云端还没有文件。点「上传」把本机推上去。';
+    actions = `<div class="btnrow"><button class="btn primary wide" data-act="sync-push">上传本机</button></div>`;
+  } else if (rd === local) {
+    verdict = '两边内容完全一致，已经同步好了。';
+    actions = '';
+  } else if (!seen) {
+    verdict = '这台设备还没建立同步基准。选一边覆盖。';
+    actions = `<div class="btnrow"><button class="btn primary wide" data-act="sync-push-force">用本机覆盖云端</button></div>
+      <div class="btnrow"><button class="btn wide" data-act="sync-pull-force">用云端覆盖本机</button></div>`;
+  } else if (local === seen) {
+    verdict = '云端比本机新。点「拉取」就同步了。';
+    actions = `<div class="btnrow"><button class="btn primary wide" data-act="sync-pull-force">拉取云端</button></div>`;
+  } else if (rd === seen) {
+    verdict = '本机有未上传的改动。点「上传」就同步了。';
+    actions = `<div class="btnrow"><button class="btn primary wide" data-act="sync-push">上传本机</button></div>`;
+  } else {
+    verdict = '两边都改过。选一边覆盖，或者合并。';
+    actions = `<div class="btnrow"><button class="btn primary wide" data-act="sync-push-force">用本机覆盖云端</button></div>
+      <div class="btnrow"><button class="btn wide" data-act="sync-pull-force">用云端覆盖本机</button></div>
+      <div class="btnrow"><button class="btn wide" data-act="sync-merge">合并两边</button></div>`;
+  }
+
+  openSheet({
+    title: '同步体检',
+    body: `
+      <p class="note" style="font-size:13px">${esc(verdict)}</p>
+      <div class="kv"><span class="k">版本</span><span class="v">${APP_VERSION}</span></div>
+      <div class="kv"><span class="k">仓库</span><span class="v" style="font-size:11px">${esc(syncCfg.repo)}</span></div>
+      <div class="kv"><span class="k">本机指纹</span><span class="v">${local.slice(0, 8)}</span></div>
+      <div class="kv"><span class="k">上次同步</span><span class="v">${seen ? seen.slice(0, 8) : '—'}</span></div>
+      <div class="kv"><span class="k">云端指纹</span><span class="v">${rd ? rd.slice(0, 8) : '（无文件）'}</span></div>
+      <div class="kv"><span class="k">云端提交</span><span class="v">${remote ? remote.sha.slice(0, 7) : '—'}</span></div>
+      <div class="kv"><span class="k">本机数据</span><span class="v">${st.chains.length} 链 · ${st.wins.length} 喜报 · ${st.precedents.length} 判例</span></div>
+      ${actions}
+      <div class="btnrow"><button class="btn ghost wide" data-act="close">关闭</button></div>`,
   });
 }
 
@@ -2116,6 +2208,10 @@ function onClick(e) {
     }
     case 'sync-open':
       openSync();
+      break;
+    case 'sync-diag':
+      closeSheet();
+      setTimeout(syncDiag, 120);
       break;
     case 'sync-conflict':
       openConflict();
