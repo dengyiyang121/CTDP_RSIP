@@ -227,6 +227,15 @@ export async function test(cfg) {
   if (!repo.permissions || !repo.permissions.push) {
     throw new SyncError('这个令牌对仓库没有写权限。Fine-grained token 里把 Contents 改成 Read and write。', { status: 403 });
   }
+
+  // 分支写错是新手最常见的 422：明确告诉默认分支是什么
+  if (repo.default_branch && cfg.branch !== repo.default_branch && repo.size > 0) {
+    const rb = await api(cfg, 'GET', `/repos/${cfg.repo}/branches/${encodeURIComponent(cfg.branch)}`, null, { retry: 1 });
+    if (rb.status === 404) {
+      throw new SyncError(`分支 ${cfg.branch} 不存在；这个仓库的默认分支是 ${repo.default_branch}，把「分支」改成它。`, { status: 404 });
+    }
+  }
+
   return { login: me.login, repo: repo.full_name, private: !!repo.private, branch: cfg.branch };
 }
 
