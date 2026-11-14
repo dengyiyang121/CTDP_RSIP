@@ -1194,7 +1194,8 @@ function openRitual(id) {
   if (!st.settings.ritual) {
     const n = C.nextN(c);
     if (led.start(id)) {
-      render();
+      afterChange();
+      scheduleChainSound(id); // 关掉锚点确认时也要排程，否则到点没声
       toast(`第 #${n} 节起链`);
     }
     return;
