@@ -1,7 +1,7 @@
 /* 离线缓存：网络优先，断了才用缓存。
    之前的 cache-first 会把旧 JS 一直喂给浏览器，界面看起来“退版本”。 */
 
-const CACHE = 'ctdp-v4';
+const CACHE = 'ctdp-v5';
 const ASSETS = [
   './',
   './index.html',
@@ -11,6 +11,7 @@ const ASSETS = [
   './assets/tree.js',
   './assets/sound.js',
   './assets/sync.js',
+  './assets/merge.js',
   './assets/ui.js',
   './assets/icon.svg',
   './assets/icon-192.png',

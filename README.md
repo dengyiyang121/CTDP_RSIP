@@ -12,6 +12,9 @@
 > 方法来自知乎《如何提高自制力？》作者 edmond（[原文](https://www.zhihu.com/question/19888447/answer/1930799480401293785)，类 MIT 授权，注明作者即可）。
 > 本仓库是独立实现，不含原文内容。
 
+**状态（2026-11-14）**：版本 `0.5.0` · 线上 https://dengyiyang121.github.io/CTDP_RSIP/
+接手的 agent 请先读 **[HANDOFF.md](HANDOFF.md)**（含现状、代码地图、同步设计、未解决问题、环境坑）。
+
 ---
 
 ## 现在能用什么
@@ -29,7 +32,7 @@
 | 导出 | Markdown（可贴微信小号/打印）与 JSON（跨设备搬运） |
 | 哈希链 | 每条事件含前一条哈希，可校验账本有没有被手改 |
 | 提示音 | 到点响一声；结链是上行三音，预约到点是三短音，剩 30 秒是单音（可关） |
-| 云同步 | 账本写进你的 GitHub **私有**仓库；手机电脑各配一次；打开自动拉、改动 20 秒后自动推 |
+| 云同步 | 账本写进你的 GitHub **私有**仓库；打开自动拉，改动约 2 秒自动推；两边都改过**自动合并**，不再让人选“覆盖/合并”；断网自动排队重试 |
 
 > 部署与同步的完整步骤见 [DEPLOY.md](DEPLOY.md)。
 
@@ -113,26 +116,33 @@ manifest.webmanifest  PWA 清单
 sw.js                 离线缓存
 assets/
   core.js             纯逻辑：状态、事件溯源、判例、结算、导出（可在 node 里跑）
+  merge.js            自动合并：并集 / 清零语义 / 墓碑 / 内容指纹（纯函数）
+  sync.js             同步传输层：GitHub Contents API、重试、同步码
   ui.js               视图与交互（无框架）
   style.css           硬边、细线、等宽数字；无渐变/无光晕
   icon*.png|svg       像素纹章
 test/
-  core.test.mjs       14 项逻辑测试（node）
+  core.test.mjs       16 项逻辑测试（node）
+  tree.test.mjs       12 项布局测试（node）
+  sync.test.mjs       21 项合并/指纹测试（node）
+  sync.e2e.mjs        双设备自动同步（真浏览器 + 假 GitHub API）
   smoke.mjs           Playwright 走完主流程 + 截图
 tools/make-icons.py   生成图标
 shots/                截图产物
+backups/              从本机浏览器里恢复出来的账本（不能进 dist）
 ```
 
 ## 测试
 
 ```bash
-node test/core.test.mjs     # 逻辑，无需浏览器
+npm test                    # core + tree + merge，纯 node
 npm install                 # 只为装 playwright-core
 npm run dev                 # 另开一个终端
 node test/smoke.mjs         # 端到端 + 截图到 shots/
+npm run test:sync           # 双设备自动同步（自带假 GitHub，不需要真令牌）
 ```
 
-`smoke.mjs` 用系统已装的 Chrome/Edge，不下载浏览器。
+`smoke.mjs` / `sync.e2e.mjs` 用系统已装的 Chrome/Edge，不下载浏览器。
 
 ---
 
@@ -144,14 +154,30 @@ node test/smoke.mjs         # 端到端 + 截图到 shots/
 - **一屏一动作**：每个页面只有一个主按钮，其余收在「⋯」里。
 - **可退化**：导出的 Markdown 能贴微信小号、能打印。随时离开 App 不丢系统。
 
+## 云同步现在怎么工作
+
+1. 打开 App / 回到前台 / 联网 → 自动拉一次。
+2. 任何改动 → 2.5 秒后自动推（commit 信息带设备 ID 和时间）。
+3. 两边都改过 → 不弹窗，直接按规则合并：
+   - 判例、喜报、冻结、结算、事件 → 取并集，永不丢；
+   - 同一条链 → 节点取并集，最近一次清零之前的节点不复活；
+   - 同一个国策 → 内化天数取较大值（同一天两台设备都结算不会双倍）；
+   - 删除 → 墓碑随账本同步，不会“删了又被另一台复活”；
+   - 事件按时间重排后重算哈希链，合并完 `verify()` 仍然完整。
+4. 推送撞上 409 → 自动重拉、合并、再推（最多 3 次）；网络失败 → 保留本地、20 秒后重试。
+5. 第一次配置时如果云端只有一个空壳（比如旧版本留下的 `rev=2`），会采用内容更满的那一边，不会把两套种子国策并在一起。
+
+正常使用不需要点“拉取 / 上传 / 合并”。设置面板里仍保留“用云端覆盖本机 / 用本机覆盖云端”作为逃生门。
+
 ## 下一步（还没做）
 
-- [x] GitHub 同步：整份账本 PUT 进私有仓库，sha 守卫，冲突时让人选
+- [x] GitHub 同步：整份账本 PUT 进私有仓库；两边都改过自动合并，不再让人选
 - [ ] `STATUS.md` 自动看板：仓库首页直接看树
 - [ ] 安卓主屏小组件 / 锁屏快捷方式（Capacitor）
 - [ ] NFC 贴纸当锚点
 - [ ] 每周复盘：崩塌热力图、维护成本趋势
 - [ ] 国策组 UI（数据层已支持 quota，界面还没做完整入口）
+- [ ] 同步适配器接口：WebDAV（坚果云/Nextcloud）作为 GitHub 之外的备选
 
 ---
 

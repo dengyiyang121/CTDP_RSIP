@@ -63,6 +63,7 @@ export function blankState() {
     app: APP_ID,
     v: VERSION,
     createdAt: Date.now(),
+    updatedAt: Date.now(),
     settings: { dayStart: 4, auxMinutes: 15, secondSignal: true, ritual: true, sound: true },
     rev: 0,
     chains: [],
@@ -73,6 +74,7 @@ export function blankState() {
     wins: [],
     events: [],
     lastPolicyDay: null,
+    deleted: { chains: {}, policies: {} },
     sync: { sha: null, at: 0, rev: 0 },
     seen: false,
   };
@@ -238,6 +240,10 @@ export class Ledger {
     // 兼容旧字段
     st.settings = { dayStart: 4, auxMinutes: 15, secondSignal: true, ritual: true, sound: true, ...(st.settings || {}) };
     st.rev = st.rev || 0;
+    st.updatedAt = st.updatedAt || st.createdAt || Date.now();
+    st.deleted = st.deleted && typeof st.deleted === 'object' ? st.deleted : { chains: {}, policies: {} };
+    st.deleted.chains = st.deleted.chains && typeof st.deleted.chains === 'object' ? st.deleted.chains : {};
+    st.deleted.policies = st.deleted.policies && typeof st.deleted.policies === 'object' ? st.deleted.policies : {};
     st.sync = st.sync || { sha: null, at: 0, rev: 0 };
     for (const c of st.chains) {
       c.nodes = c.nodes || [];
@@ -268,7 +274,14 @@ export class Ledger {
 
   _commit(type, payload) {
     this.state.rev = (this.state.rev || 0) + 1;
+    this.state.updatedAt = Date.now();
     this._log(type, payload);
+    this.save();
+  }
+
+  /** 本地直接改完状态后调用：落盘并打上时间戳，但不新增事件 */
+  touch() {
+    this.state.updatedAt = Date.now();
     this.save();
   }
 
@@ -308,6 +321,17 @@ export class Ledger {
     if (!c) return false;
     Object.assign(c, patch);
     this._commit('chain.update', { id, patch });
+    return true;
+  }
+
+  /** 删除主链：写墓碑，防止另一台设备同步时把它复活 */
+  deleteChain(id) {
+    const c = chainById(this.state, id);
+    if (!c) return false;
+    this.state.deleted = this.state.deleted || { chains: {}, policies: {} };
+    this.state.deleted.chains[id] = Date.now();
+    this.state.chains = this.state.chains.filter((x) => x.id !== id);
+    this._commit('chain.delete', { id });
     return true;
   }
 
@@ -490,6 +514,19 @@ export class Ledger {
     p.clearedAt = null;
     this._commit('policy.restore', { id });
     return true;
+  }
+
+  /** 删除国策（连后代）：写墓碑，防止另一台设备同步时复活 */
+  deletePolicy(id) {
+    const p = policyById(this.state, id);
+    if (!p) return false;
+    const ids = [id, ...descendantIds(this.state, id)];
+    this.state.deleted = this.state.deleted || { chains: {}, policies: {} };
+    const now = Date.now();
+    for (const pid of ids) this.state.deleted.policies[pid] = now;
+    this.state.policies = this.state.policies.filter((x) => !ids.includes(x.id));
+    this._commit('policy.delete', { ids });
+    return ids;
   }
 
   /** 日结算：默认全亮，只报“崩了”的 */

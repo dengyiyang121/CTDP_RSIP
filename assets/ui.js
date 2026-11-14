@@ -6,8 +6,9 @@ import * as C from './core.js';
 import { layoutTree, edgePath } from './tree.js';
 import * as S from './sound.js';
 import * as G from './sync.js';
+import * as M from './merge.js';
 
-const APP_VERSION = '0.4.2';
+const APP_VERSION = '0.5.0';
 
 /* ---------------- 元素 ---------------- */
 const $ = (s, r = document) => r.querySelector(s);
@@ -105,43 +106,15 @@ function rescheduleAll() {
 let syncCfg = G.loadCfg();
 let syncTimer = null;
 let syncBusy = false;
-let syncConflict = false;
-let lastAutoWarn = 0;
+let syncQueued = false;
+/** 只在内存里：同步状态，不进账本 */
+const syncState = { phase: G.configured(syncCfg) ? 'idle' : 'off', err: '', errAt: 0, action: '', remoteSha: '', step: '' };
 
 const syncInfo = () => st.sync || { sha: null, at: 0, rev: 0, digest: '' };
-
-/** 内容指纹：不含 sync 字段，用来判断“本机是否真的改过” */
-function digestOf(s) {
-  return C.fnv1a(JSON.stringify({ ...s, sync: null }));
-}
-const localDigest = () => digestOf(st);
+const localDigest = () => M.stateDigest(st);
 const isDirty = () => localDigest() !== (syncInfo().digest || '');
 
-/** 远端指纹必须先把状态跑一遍规范化，否则和本地永远对不上 */
-function remoteDigest(text) {
-  const obj = JSON.parse(text);
-  if (!obj || obj.app !== C.APP_ID) throw new Error('云端文件不是本应用的账本');
-  const fresh = C.Ledger.load(JSON.stringify(obj), { save: null });
-  return { digest: digestOf(fresh.state), state: fresh.state };
-}
-
-function markSynced(sha) {
-  st.sync = { sha, at: Date.now(), rev: st.rev || 0, digest: localDigest() };
-  led.save();
-}
-
-function syncLine() {
-  if (!G.configured(syncCfg)) {
-    return '未配置。配好后手机和电脑共用一份账本；数据放在你自己的私有仓库里。';
-  }
-  const info = syncInfo();
-  if (syncConflict) return '⚠ 云端和本地都改过，需要手动选一次（点「拉取」或「上传」）。';
-  if (!info.at) return '已配置，还没同步过。先点「上传」把本机账本推上去。';
-  const when = C.fmtHM(info.at);
-  return isDirty() ? `本地有改动未上传 · 上次同步 ${when}` : `已同步 · ${when}${info.sha ? ' · ' + info.sha.slice(0, 7) : ''}`;
-}
-
-function applyRemote(text, sha) {
+function parseRemote(text) {
   let obj;
   try {
     obj = JSON.parse(text);
@@ -149,214 +122,343 @@ function applyRemote(text, sha) {
     throw new Error('云端文件不是合法 JSON');
   }
   if (!obj || obj.app !== C.APP_ID) throw new Error('云端文件不是本应用的账本');
-  const fresh = C.Ledger.load(JSON.stringify(obj), { save: led._save });
+  const fresh = C.Ledger.load(JSON.stringify(obj), { save: null });
+  return { state: fresh.state, digest: M.stateDigest(fresh.state) };
+}
+
+/** 兼容旧调用：只要指纹 */
+function remoteDigest(text) {
+  return parseRemote(text).digest;
+}
+
+function markSynced(sha, digest) {
+  st.sync = { sha: sha || null, at: Date.now(), rev: st.rev || 0, digest: digest || localDigest() };
+  led.save();
+  syncState.phase = 'ok';
+  syncState.err = '';
+  syncState.errAt = 0;
+  syncState.remoteSha = sha || '';
+}
+
+/** 状态条只替换它自己，不重画整页 */
+function paintSyncBar() {
+  const el = document.querySelector('.syncbar');
+  if (!el) return;
+  const html = syncBar();
+  if (!html) el.remove();
+  else el.outerHTML = html;
+}
+
+function setPhase(phase, err) {
+  syncState.phase = phase;
+  if (err) {
+    syncState.err = err.message || String(err);
+    syncState.errAt = Date.now();
+  }
+  paintSyncBar();
+}
+
+function syncLine() {
+  if (!G.configured(syncCfg)) {
+    return '未配置。配好后手机和电脑共用一份账本；数据放在你自己的私有仓库里。';
+  }
+  if (syncBusy || syncState.phase === 'syncing') return '正在同步…';
+  if (syncState.phase === 'error') {
+    return `同步暂时失败：${syncState.err}。本地照常可用，联网后会自动重试。`;
+  }
+  const info = syncInfo();
+  if (!info.at) return '已配置。第一次同步会自动合并两边，不会让你选。';
+  if (isDirty()) return `本地有改动，稍后自动上传 · 上次同步 ${C.fmtHM(info.at)}`;
+  const extra = syncState.action === 'merged' ? ' · 已自动合并' : '';
+  return `已同步 · ${C.fmtHM(info.at)}${info.sha ? ' · ' + info.sha.slice(0, 7) : ''}${extra}`;
+}
+
+/* 覆盖前留一份本机快照；只留最近 3 份 */
+const BACKUP_PREFIX = 'ctdp.bak.';
+function backupLocal(tag) {
+  try {
+    const key = BACKUP_PREFIX + Date.now();
+    localStorage.setItem(key, JSON.stringify({ tag, at: Date.now(), state: st }));
+    const keys = Object.keys(localStorage)
+      .filter((k) => k.startsWith(BACKUP_PREFIX))
+      .sort();
+    while (keys.length > 3) {
+      const old = keys.shift();
+      if (old !== key) localStorage.removeItem(old);
+    }
+  } catch (e) {
+    /* 配额不够就算了，不能因为备份失败挡住同步 */
+  }
+}
+
+/**
+ * 采用一份状态。
+ * synced=true 表示这份就是云端那份（sha 对得上）；false 表示只是本地合并结果，
+ * 还不能标记为已同步，否则上传失败会被误认为干净。
+ */
+function adoptState(state, { sha = null, synced = false, backup = 'before-apply' } = {}) {
+  const oldSync = { ...syncInfo() };
+  if (backup) backupLocal(backup);
+  const fresh = C.Ledger.load(JSON.stringify(state), { save: led._save });
   led.state = fresh.state;
   st = led.state;
-  st.sync = { sha, at: Date.now(), rev: st.rev || 0, digest: digestOf(st) };
+  st.sync = synced
+    ? { sha: sha || null, at: Date.now(), rev: st.rev || 0, digest: M.stateDigest(st) }
+    : oldSync;
   led.save();
-  syncConflict = false;
+  rescheduleAll();
   render();
 }
 
-async function doPull({ silent = false, force = false } = {}) {
+function commitMessage(label) {
+  let when = '';
+  try {
+    when = new Date().toLocaleString('zh-CN', { hour12: false });
+  } catch (e) {
+    when = new Date().toISOString();
+  }
+  return `账本 · ${label} · ${G.deviceId()} · ${when}`;
+}
+
+/**
+ * 上传一份状态。遇到 409/422 就重拉、自动合并、再试。
+ * 这是“自动同步”的关键：不把冲突推给人。
+ */
+async function pushState(state, sha, label) {
+  let cur = state;
+  let baseSha = sha;
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const digest = M.stateDigest(cur);
+    const wire = JSON.stringify({ ...cur, sync: null });
+    syncState.step = `push-${attempt}`;
+    const res = await G.push(syncCfg, wire, baseSha, commitMessage(label));
+
+    if (!res.conflict) {
+      markSynced(res.sha, digest);
+      syncState.action = attempt ? 'merged' : label === '自动合并' ? 'merged' : 'push';
+      toast(attempt || label === '自动合并' ? '已自动合并并上传' : '已上传');
+      return true;
+    }
+
+    // 云端在我们读取之后又被改过：重拉、合并、再推
+    syncState.step = `conflict-${attempt}-pull`;
+    const remote = await G.pull(syncCfg);
+    if (!remote) {
+      baseSha = null;
+      continue;
+    }
+    const rr = parseRemote(remote.text);
+    const m = M.mergeStates(cur, rr.state);
+    if (m.action === 'remote') {
+      adoptState(m.state, { sha: remote.sha, synced: true });
+      toast('云端刚更新，已采用云端');
+      return true;
+    }
+    adoptState(m.state, { synced: false });
+    cur = led.state;
+    baseSha = remote.sha;
+  }
+
+  throw new Error('连续冲突，稍后会自动重试');
+}
+
+/**
+ * 自动同步。
+ * 判定顺序：
+ *   1. 云端没文件 → 上传本机
+ *   2. 两边内容一样 → 结束
+ *   3. 只有本机变了 → 上传
+ *   4. 只有云端变了 → 拉取
+ *   5. 没法判断 / 两边都变了 → 自动判断包含关系，否则合并后上传
+ * 全程不需要人点“冲突处理”。
+ */
+async function syncNow({ manual = false, reason = 'auto' } = {}) {
+  if (!G.configured(syncCfg)) {
+    if (manual) openSync();
+    return false;
+  }
+  if (syncBusy) {
+    // 正在同步时又有改动/手动点击：等这一轮结束再跑一次，别把这次触发丢掉
+    syncQueued = true;
+    return false;
+  }
+
+  syncBusy = true;
+  const start = localDigest();
+  try {
+    syncState.phase = 'syncing';
+    syncState.err = '';
+    syncState.step = 'pull';
+    paintSyncBar();
+
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+      throw new G.SyncError('设备离线，联网后会自动同步。', { retryable: true });
+    }
+
+    const remote = await G.pull(syncCfg);
+    syncState.step = 'pulled';
+
+    // 拉取期间本地又改了：这次别落盘，稍后重来，免得把刚写的东西覆盖掉
+    if (localDigest() !== start) {
+      scheduleSync(500);
+      return false;
+    }
+
+    if (!remote) {
+      await pushState(st, null, '首次上传');
+      return true;
+    }
+
+    const rr = parseRemote(remote.text);
+    syncState.step = 'compare';
+    const seen = syncInfo().digest || '';
+
+    if (rr.digest === start) {
+      markSynced(remote.sha, start);
+      syncState.action = 'same';
+      if (manual) toast('已是最新');
+      return true;
+    }
+
+    if (seen && rr.digest === seen) {
+      await pushState(st, remote.sha, '上传改动');
+      return true;
+    }
+
+    if (seen && start === seen) {
+      adoptState(rr.state, { sha: remote.sha, synced: true });
+      syncState.action = 'pull';
+      syncState.phase = 'ok';
+      if (manual) toast('已拉取云端');
+      else if (reason === 'boot') toast('已从云端更新');
+      return true;
+    }
+
+    // 没有基准（第一次配置），或两边都改过：自动判断，绝不弹窗让人选
+    const m = seen ? M.mergeStates(st, rr.state) : M.bootstrapStates(st, rr.state);
+    if (m.action === 'local') {
+      await pushState(m.state, remote.sha, '上传本机账本');
+      return true;
+    }
+    if (m.action === 'remote') {
+      adoptState(m.state, { sha: remote.sha, synced: true });
+      syncState.action = 'pull';
+      syncState.phase = 'ok';
+      toast('已采用云端版本');
+      return true;
+    }
+
+    adoptState(m.state, { synced: false });
+    await pushState(led.state, remote.sha, '自动合并');
+    return true;
+  } catch (e) {
+    setPhase('error', e);
+    if (manual) toast(e.message || '同步失败');
+    // 网络 / 限流 / 5xx 晚点再来；令牌错误别每 20 秒骚扰一次
+    scheduleSync(e && e.retryable ? 20000 : 60000);
+    return false;
+  } finally {
+    syncBusy = false;
+    syncState.step = 'done';
+    if (syncState.phase === 'syncing') syncState.phase = syncState.err ? 'error' : 'ok';
+    paintSyncBar();
+    if (ui.tab === 'archive') render();
+    if (syncQueued) {
+      syncQueued = false;
+      scheduleSync(300);
+    }
+  }
+}
+
+function scheduleSync(ms = 2500) {
+  clearTimeout(syncTimer);
+  syncTimer = setTimeout(() => syncNow({}), Math.max(300, ms));
+}
+
+function autoSyncSoon() {
+  if (!G.configured(syncCfg)) return;
+  scheduleSync(2500);
+}
+
+/** 手动：用云端覆盖本机（危险操作，调用处要二次确认） */
+async function forcePull({ silent = false } = {}) {
   if (!G.configured(syncCfg)) return false;
   try {
     const remote = await G.pull(syncCfg);
     if (!remote) {
-      if (!silent) toast('云端还没有文件，先「上传」一次');
+      if (!silent) toast('云端还没有文件');
       return false;
     }
-    let remoteState;
-    try {
-      remoteState = JSON.parse(remote.text);
-    } catch (e) {
-      throw new Error('云端文件不是合法 JSON');
-    }
-    if (!remoteState || remoteState.app !== C.APP_ID) throw new Error('云端文件不是本应用的账本');
-    if (!force && remoteDigest(remote.text).digest === localDigest()) {
-      markSynced(remote.sha);
-      if (!silent) toast('云端和本机一致');
-      render();
-      return true;
-    }
-    applyRemote(remote.text, remote.sha);
-    if (!silent) toast('已拉取云端账本');
+    const rr = parseRemote(remote.text);
+    adoptState(rr.state, { sha: remote.sha, synced: true, backup: 'before-force-pull' });
+    syncState.action = 'pull';
+    syncState.phase = 'ok';
+    if (!silent) toast('已用云端覆盖本机');
     return true;
   } catch (e) {
+    setPhase('error', e);
     if (!silent) toast(e.message || '拉取失败');
     return false;
   }
 }
 
-async function doPush({ silent = false, force = false } = {}) {
+/** 手动：用本机覆盖云端（危险操作，调用处要二次确认） */
+async function forcePush({ silent = false } = {}) {
   if (!G.configured(syncCfg)) return false;
   try {
-    let sha = syncInfo().sha;
-    if (force) {
-      // 显式覆盖时先取当前 sha，别拿旧的去撞 409
-      const remote = await G.pull(syncCfg);
-      sha = remote ? remote.sha : null;
-    }
-    const res = await G.push(syncCfg, JSON.stringify(st), sha, `账本 ${new Date().toLocaleString('zh-CN')}`);
+    const remote = await G.pull(syncCfg);
+    const res = await G.push(
+      syncCfg,
+      JSON.stringify({ ...st, sync: null }),
+      remote ? remote.sha : null,
+      commitMessage('手动覆盖云端')
+    );
     if (res.conflict) {
-      syncConflict = true;
-      if (!silent) toast('云端已经变了，先拉取对比');
-      render();
+      if (!silent) toast('云端刚变过，先点「立即同步」自动合并');
       return false;
     }
-    markSynced(res.sha);
-    syncConflict = false;
-    if (!silent) toast('已上传');
-    render();
+    markSynced(res.sha, localDigest());
+    syncState.action = 'push';
+    if (!silent) toast('已用本机覆盖云端');
     return true;
   } catch (e) {
+    setPhase('error', e);
     if (!silent) toast(e.message || '上传失败');
     return false;
   }
 }
 
-/** 用 #sync=<base64url>&mode=push|pull 一条链接完成配置（片段不会发到服务器） */
-function b64urlDecode(s) {
-  const b = s.replace(/-/g, '+').replace(/_/g, '/');
-  const pad = b.length % 4 ? '='.repeat(4 - (b.length % 4)) : '';
-  const bin = atob(b + pad);
-  const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0));
-  return new TextDecoder().decode(bytes);
-}
-
+/** 用 #sync=<同步码>&mode=push|pull 一条链接完成配置（片段不会发到服务器） */
 function applySyncHash() {
   const hash = location.hash || '';
   const m = /[#&]sync=([A-Za-z0-9_-]+)/.exec(hash);
   if (!m) return false;
   try {
-    const cfg = JSON.parse(b64urlDecode(m[1]));
-    if (!cfg || !cfg.repo || !cfg.token) throw new Error('bad');
-    G.saveCfg({ ...G.DEF, ...cfg });
-    syncCfg = G.loadCfg();
+    const cfg = G.decodeCode(m[1]);
+    adoptSyncCfg(cfg);
     const mode = /[#&]mode=(push|pull)/.exec(hash);
     history.replaceState(null, '', location.pathname + location.search);
     render();
     toast(`云同步已配置：${cfg.repo}`);
-    if (mode) {
-      setTimeout(() => {
-        if (mode[1] === 'push') doPush({ force: true });
-        else doPull({});
-      }, 600);
-    }
+    setTimeout(() => {
+      if (mode && mode[1] === 'pull') forcePull({ silent: false });
+      else if (mode && mode[1] === 'push') forcePush({ silent: false });
+      else syncNow({ manual: true });
+    }, 600);
     return true;
   } catch (e) {
-    toast('配置链接无效');
+    toast('同步码无效');
     return false;
   }
-}
-
-/** 改动后 20 秒自动推一次；开机时若本地干净就自动拉 */
-/** 两边都动过：别猜，等人选 */
-function flagConflict(manual) {
-  syncConflict = true;
-  render();
-  const now = Date.now();
-  if (manual || now - lastAutoWarn > 60000) {
-    lastAutoWarn = now;
-    toast('云端和本机都改过，同步暂停了');
-  }
-  return false;
-}
-
-/**
- * 三方比较：本机 == 上次同步？云端 == 上次同步？
- * 只有一边动过就自动同步；两边都动过就停下来等人选。
- */
-async function syncNow({ manual = false } = {}) {
-  if (!G.configured(syncCfg) || syncBusy) return false;
-  syncBusy = true;
-  try {
-    const remote = await G.pull(syncCfg);
-    const local = localDigest();
-    const seen = syncInfo().digest || '';
-
-    if (!remote) return await doPush({ silent: !manual, force: true });
-
-    let remoteState;
-    try {
-      remoteState = JSON.parse(remote.text);
-    } catch (e) {
-      throw new Error('云端文件不是合法 JSON');
-    }
-    if (!remoteState || remoteState.app !== C.APP_ID) throw new Error('云端文件不是本应用的账本');
-
-    const rd = remoteDigest(remote.text).digest;
-
-    if (rd === local) {
-      markSynced(remote.sha);
-      syncConflict = false;
-      render();
-      return true;
-    }
-    if (!seen) {
-      // 全新设备（几乎没动过）直接接云端；动过就别猜
-      const fresh = (st.events || []).length <= 1 && !st.wins.length && !st.precedents.length;
-      if (fresh) {
-        applyRemote(remote.text, remote.sha);
-        if (manual) toast('已拉取云端账本');
-        return true;
-      }
-      return flagConflict(manual);
-    }
-    if (local === seen) {
-      applyRemote(remote.text, remote.sha);
-      if (manual) toast('已拉取云端账本');
-      return true;
-    }
-    if (rd === seen) return await doPush({ silent: !manual });
-    return flagConflict(manual);
-  } catch (e) {
-    if (manual) toast(e.message || '同步失败');
-    return false;
-  } finally {
-    syncBusy = false;
-  }
-}
-
-/** 冲突时的一键合并：只对“只会增加”的集合取并集 */
-function mergeRemote(text) {
-  const remote = JSON.parse(text);
-  const union = (a, b) => {
-    const ids = new Set(a.map((x) => x.id));
-    return [...a, ...(b || []).filter((x) => !ids.has(x.id))];
-  };
-  st.precedents = union(st.precedents, remote.precedents);
-  st.wins = union(st.wins, remote.wins);
-  for (const rc of remote.chains || []) {
-    const lc = st.chains.find((c) => c.id === rc.id);
-    if (!lc) st.chains.push(rc);
-    else if ((rc.nodes || []).length > (lc.nodes || []).length) {
-      lc.nodes = rc.nodes;
-      lc.resets = rc.resets || lc.resets;
-    }
-  }
-  led.save();
-  render();
-}
-
-function autoSyncSoon() {
-  if (!G.configured(syncCfg)) return;
-  clearTimeout(syncTimer);
-  syncTimer = setTimeout(() => syncNow({}), 8000);
 }
 
 async function bootSync() {
   if (!G.configured(syncCfg)) return;
-  await syncNow({});
-  rescheduleAll();
-  if (syncConflict && els.overlay.hidden) {
-    setTimeout(() => {
-      if (syncConflict) openConflict();
-    }, 700);
-  }
+  await syncNow({ reason: 'boot' });
 }
 
-/* 回到前台、恢复联网、以及每 45 秒都试一次 */
+/* 回到前台、恢复联网、以及每 30 秒都试一次 */
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible' && G.configured(syncCfg)) syncNow({});
 });
@@ -365,7 +467,7 @@ window.addEventListener('online', () => {
 });
 setInterval(() => {
   if (document.visibilityState === 'visible' && G.configured(syncCfg) && !syncBusy) syncNow({});
-}, 45000);
+}, 30000);
 
 let toastTimer = null;
 let flashTimer = null;
@@ -580,25 +682,24 @@ function chainCard(c, now) {
   </article>`;
 }
 
-/** 主链顶部的同步状态条：一眼能看到“有没有上传” */
+/** 主链顶部的同步状态条：一眼能看到“同步到哪了” */
 function syncBar() {
   if (!G.configured(syncCfg)) return '';
   const info = syncInfo();
   let cls = 'ok';
   let text = `已同步 · ${C.fmtHM(info.at)}`;
-  let act = 'sync-open';
-  if (syncConflict) {
+  const act = 'sync-now';
+  if (syncBusy || syncState.phase === 'syncing') {
+    text = '正在同步…';
+  } else if (syncState.phase === 'error') {
     cls = 'warn';
-    text = '两边都改过 · 去处理';
-    act = 'sync-conflict';
+    text = '同步失败 · 点一下重试';
   } else if (!info.at) {
     cls = 'dirty';
-    text = '还没同步过 · 立即上传';
-    act = 'sync-push';
+    text = '还没同步过 · 点一下同步';
   } else if (isDirty()) {
     cls = 'dirty';
-    text = '有改动未上传 · 立即上传';
-    act = 'sync-push';
+    text = '有改动未上传 · 点一下同步';
   }
   return `<button class="syncbar ${cls}" data-act="${act}">
     <span class="sdot" aria-hidden="true"></span>
@@ -630,14 +731,6 @@ function viewChains() {
                <span>今日尚未结算。国策不会自动灭，也不会自动变好。</span>
                <button class="btn" data-act="settle">结算</button>
              </div>`
-      }
-      ${
-        syncConflict
-          ? `<div class="warn" style="margin-top:10px;display:flex;gap:12px;align-items:center;justify-content:space-between">
-               <span>云端和本机都改过，自动同步暂停。</span>
-               <button class="btn" data-act="sync-conflict">处理</button>
-             </div>`
-          : ''
       }
     </section>`;
 
@@ -892,19 +985,18 @@ function viewArchive() {
     </section>
 
     <section class="section">
-      <div class="sec-head">云同步<span class="spacer"></span><span class="hint">${G.configured(syncCfg) ? '已配置' : '未配置'}</span></div>
+      <div class="sec-head">云同步<span class="spacer"></span><span class="hint">${
+        G.configured(syncCfg) ? (syncState.phase === 'error' ? '待重试' : '自动') : '未配置'
+      }</span></div>
       <div class="note">${esc(syncLine())}</div>
-      ${
-        syncConflict
-          ? `<div class="btnrow" style="margin-top:10px"><button class="btn danger wide" data-act="sync-conflict">处理冲突</button></div>`
-          : ''
-      }
       <div class="btnrow" style="margin-top:10px">
-        <button class="btn" data-act="sync-pull" ${G.configured(syncCfg) ? '' : 'disabled'}>拉取</button>
-        <button class="btn" data-act="sync-push" ${G.configured(syncCfg) ? '' : 'disabled'}>上传</button>
+        <button class="btn primary" data-act="sync-now" ${G.configured(syncCfg) ? '' : 'disabled'}>${
+          isDirty() ? '立即同步' : '检查云端'
+        }</button>
+        <button class="btn" data-act="sync-open">设置</button>
       </div>
       <div class="btnrow">
-        <button class="btn ghost wide" data-act="sync-open">${G.configured(syncCfg) ? '设置 / 断开' : '配置云同步（GitHub 私有仓库）'}</button>
+        <button class="btn ghost wide" data-act="sync-diag" ${G.configured(syncCfg) ? '' : 'disabled'}>同步体检</button>
       </div>
     </section>
 
@@ -1497,8 +1589,9 @@ function openNewChain() {
 /* ---------------- 流程：导出 / 导入 ---------------- */
 
 function markExport(kind) {
+  // 导出只是本机动作，不该产生同步事件，也不该把账本标成“有改动”
   st.lastExportAt = Date.now();
-  led._commit('export.' + kind, {});
+  led.touch();
   render();
 }
 
@@ -1530,12 +1623,12 @@ function openExportMd() {
   });
 }
 
-async function copyText(text) {
+async function copyText(text, sel = '#md-out') {
   try {
     await navigator.clipboard.writeText(text);
     toast('已复制');
   } catch (e) {
-    const ta = $('#md-out');
+    const ta = $(sel);
     if (ta) {
       ta.focus();
       ta.select();
@@ -1545,6 +1638,8 @@ async function copyText(text) {
       } catch (err) {
         toast('复制失败，请手动选中');
       }
+    } else {
+      toast('复制失败，请手动选中');
     }
   }
 }
@@ -1586,10 +1681,14 @@ function tryImport(text) {
   const fresh = C.Ledger.load(JSON.stringify(obj), { save: led._save });
   led.state = fresh.state;
   st = led.state;
-  led.save();
+  // 导入是本机的一次真实变更：留一条事件，并让它比云端旧数据“更新”
+  st.updatedAt = Date.now();
+  led._commit('state.import', { rev: st.rev || 0 });
   closeSheet();
+  rescheduleAll();
   render();
-  toast('已导入');
+  autoSyncSoon();
+  toast('已导入，稍后自动同步');
 }
 
 /* ---------------- 流程：设置 / 说明 ---------------- */
@@ -1621,34 +1720,44 @@ function openSettings() {
   });
 }
 
-function openConflict() {
-  openSheet({
-    title: '云端和本机都改过',
-    body: `
-      <p class="tip" style="margin-top:0">两边都有新内容，自动同步先停住了。选一边覆盖，或者合并。</p>
-      <div class="note" style="font-size:13px">
-        合并＝判例、喜报取并集；同一条链保留节点更多的那份；国策树以本机为准。
-      </div>
-      <div class="btnrow" style="margin-top:12px">
-        <button class="btn primary wide" data-act="sync-push-force">用本机覆盖云端</button>
-      </div>
-      <div class="btnrow">
-        <button class="btn wide" data-act="sync-pull-force">用云端覆盖本机</button>
-      </div>
-      <div class="btnrow">
-        <button class="btn wide" data-act="sync-merge">合并两边</button>
-      </div>
-      <div class="btnrow"><button class="btn ghost wide" data-act="close">先不动</button></div>`,
-  });
+function adoptSyncCfg(cfg) {
+  const old = syncCfg;
+  G.saveCfg(cfg);
+  const next = G.loadCfg();
+  const changed = next.repo !== old.repo || next.path !== old.path || next.branch !== old.branch || next.apiBase !== old.apiBase;
+  syncCfg = next;
+  if (changed) {
+    // 换了仓库/路径/分支：旧的 sha 和指纹都不再适用
+    st.sync = { sha: null, at: 0, rev: 0, digest: '' };
+    led.save();
+  }
+  syncState.phase = 'idle';
+  syncState.err = '';
+  syncState.action = '';
+  syncState.step = '';
+}
+
+function readSyncForm() {
+  const val = (sel, fallback) => {
+    const el = $(sel);
+    return el ? el.value.trim() : fallback;
+  };
+  return {
+    repo: val('#sy-repo', syncCfg.repo),
+    path: val('#sy-path', syncCfg.path) || 'ledger/state.json',
+    branch: val('#sy-branch', syncCfg.branch) || 'main',
+    token: val('#sy-token', syncCfg.token),
+  };
 }
 
 function openSync() {
   const c = syncCfg;
-  const link = c.repo ? `https://github.com/${c.repo}/blob/${c.branch}/${c.path}` : '';
+  const link = c.repo ? `https://github.com/${c.repo}/blob/${c.branch}/${encodeURI(c.path)}` : '';
+  const code = G.configured(c) ? G.encodeCode(c) : '';
   openSheet({
     title: '云同步',
     body: `
-      <p class="tip" style="margin-top:0">账本写到你的<b>私有仓库</b>，手机和电脑各配一次即可。每次上传都是一次 commit，覆盖了也能回滚。</p>
+      <p class="tip" style="margin-top:0">账本写进你自己的<b>私有仓库</b>。配好之后：打开自动拉、改动约 2 秒自动推、两边都改过自动合并——不会再弹“选哪边”。每次上传都是一次 commit，覆盖了也能在仓库历史里找回。</p>
       <div class="field">
         <label for="sy-repo">仓库（owner/repo）</label>
         <input id="sy-repo" type="text" value="${esc(c.repo)}" placeholder="yourname/ctdp-ledger">
@@ -1669,58 +1778,97 @@ function openSync() {
       ${link ? `<p class="tip">云端文件：<a href="${esc(link)}" target="_blank" rel="noreferrer">${esc(link)}</a></p>` : ''}
       <div class="btnrow">
         <button class="btn" data-act="sync-test">测试连接</button>
-        <button class="btn primary" data-act="sync-save">保存</button>
+        <button class="btn primary" data-act="sync-save">保存并同步</button>
       </div>
       ${
         G.configured(c)
-          ? `<div class="btnrow"><button class="btn wide" data-act="sync-diag">同步体检（看两边差在哪）</button></div>`
-          : ''
-      }
-      ${
-        G.configured(c)
-          ? `<div class="btnrow"><button class="btn ghost wide" data-act="sync-forget">清除配置（账本不动）</button></div>`
-          : ''
+          ? `<div class="sec-head" style="margin-top:18px">这台设备</div>
+             <div class="btnrow">
+               <button class="btn wide" data-act="sync-now">立即同步</button>
+               <button class="btn wide" data-act="sync-diag">同步体检</button>
+             </div>
+             <div class="field">
+               <label for="sy-code">同步码（换设备时用，免去重填令牌）</label>
+               <textarea id="sy-code" readonly style="min-height:72px;font-family:var(--mono);font-size:11px">${esc(code)}</textarea>
+             </div>
+             <div class="btnrow">
+               <button class="btn" data-act="sync-copy-code">复制同步码</button>
+               <button class="btn ghost" data-act="sync-code-open">输入同步码</button>
+             </div>
+             <div class="sec-head" style="margin-top:18px">危险操作</div>
+             <div class="btnrow"><button class="btn ghost wide" data-act="sync-push-force">用本机覆盖云端</button></div>
+             <div class="btnrow"><button class="btn ghost wide" data-act="sync-pull-force">用云端覆盖本机</button></div>
+             <div class="btnrow"><button class="btn ghost wide" data-act="sync-forget">清除配置（账本不动）</button></div>
+             <p class="tip">同步码里含令牌，只发给你自己的设备。</p>`
+          : `<div class="btnrow"><button class="btn ghost wide" data-act="sync-code-open">输入另一台设备的同步码</button></div>`
       }`,
   });
 }
 
-/** 体检：把本机 / 上次同步 / 云端 三个指纹摆出来，并给出下一步 */
+function openSyncCode() {
+  openSheet({
+    title: '输入同步码',
+    body: `
+      <p class="tip" style="margin-top:0">在另一台设备打开：档案 → 云同步 → 复制同步码。贴到这里，四个字段一次填好。</p>
+      <div class="field">
+        <label for="sy-code-in">同步码</label>
+        <textarea id="sy-code-in" style="min-height:90px;font-family:var(--mono);font-size:11px" placeholder="eyJyZXBv…"></textarea>
+      </div>
+      <div class="btnrow"><button class="btn primary wide" data-act="sync-code-apply">应用并同步</button></div>
+      <div class="btnrow"><button class="btn ghost wide" data-act="close">取消</button></div>`,
+  });
+}
+
+/** 体检：把本机 / 上次同步 / 云端 三个指纹摆出来，并说明下一步会自动做什么 */
 async function syncDiag() {
   if (!G.configured(syncCfg)) return toast('先配置云同步');
   let remote = null;
   let rd = '';
+  let remoteState = null;
   try {
     remote = await G.pull(syncCfg);
-    if (remote) rd = remoteDigest(remote.text).digest;
+    if (remote) {
+      const rr = parseRemote(remote.text);
+      rd = rr.digest;
+      remoteState = rr.state;
+    }
   } catch (e) {
     return toast(e.message || '拉不到云端');
   }
   const local = localDigest();
   const seen = syncInfo().digest || '';
 
-  let verdict;
-  let actions;
+  let verdict = '';
+  let actions = '';
   if (!remote) {
-    verdict = '云端还没有文件。点「上传」把本机推上去。';
-    actions = `<div class="btnrow"><button class="btn primary wide" data-act="sync-push">上传本机</button></div>`;
+    verdict = '云端还没有文件。下一次自动同步会创建它。';
+    actions = `<div class="btnrow"><button class="btn primary wide" data-act="sync-now">现在同步</button></div>`;
   } else if (rd === local) {
     verdict = '两边内容完全一致，已经同步好了。';
-    actions = '';
   } else if (!seen) {
-    verdict = '这台设备还没建立同步基准。选一边覆盖。';
-    actions = `<div class="btnrow"><button class="btn primary wide" data-act="sync-push-force">用本机覆盖云端</button></div>
-      <div class="btnrow"><button class="btn wide" data-act="sync-pull-force">用云端覆盖本机</button></div>`;
+    const m = M.bootstrapStates(st, remoteState);
+    verdict =
+      m.action === 'local'
+        ? '这台设备的数据更全：下次同步会把它上传，不会用空云端覆盖你。'
+        : m.action === 'remote'
+          ? '云端的数据更全：下次同步会自动拉下来。'
+          : '两边都有内容：下次同步会自动合并，判例、喜报、链、国策都不会丢。';
+    actions = `<div class="btnrow"><button class="btn primary wide" data-act="sync-now">现在就自动处理</button></div>`;
   } else if (local === seen) {
-    verdict = '云端比本机新。点「拉取」就同步了。';
-    actions = `<div class="btnrow"><button class="btn primary wide" data-act="sync-pull-force">拉取云端</button></div>`;
+    verdict = '云端比本机新。下次同步会自动拉取。';
+    actions = `<div class="btnrow"><button class="btn primary wide" data-act="sync-now">现在拉取</button></div>`;
   } else if (rd === seen) {
-    verdict = '本机有未上传的改动。点「上传」就同步了。';
-    actions = `<div class="btnrow"><button class="btn primary wide" data-act="sync-push">上传本机</button></div>`;
+    verdict = '本机有未上传的改动。下次同步会自动上传。';
+    actions = `<div class="btnrow"><button class="btn primary wide" data-act="sync-now">现在上传</button></div>`;
   } else {
-    verdict = '两边都改过。选一边覆盖，或者合并。';
-    actions = `<div class="btnrow"><button class="btn primary wide" data-act="sync-push-force">用本机覆盖云端</button></div>
-      <div class="btnrow"><button class="btn wide" data-act="sync-pull-force">用云端覆盖本机</button></div>
-      <div class="btnrow"><button class="btn wide" data-act="sync-merge">合并两边</button></div>`;
+    const m = M.mergeStates(st, remoteState);
+    verdict =
+      m.action === 'merged'
+        ? '两边都改过。会自动合并，不需要你选。'
+        : m.action === 'local'
+          ? '本机包含云端的所有内容，下次同步会上传本机。'
+          : '云端包含本机的所有内容，下次同步会采用云端。';
+    actions = `<div class="btnrow"><button class="btn primary wide" data-act="sync-now">现在自动处理</button></div>`;
   }
 
   openSheet({
@@ -1734,6 +1882,17 @@ async function syncDiag() {
       <div class="kv"><span class="k">云端指纹</span><span class="v">${rd ? rd.slice(0, 8) : '（无文件）'}</span></div>
       <div class="kv"><span class="k">云端提交</span><span class="v">${remote ? remote.sha.slice(0, 7) : '—'}</span></div>
       <div class="kv"><span class="k">本机数据</span><span class="v">${st.chains.length} 链 · ${st.wins.length} 喜报 · ${st.precedents.length} 判例</span></div>
+      ${
+        remoteState
+          ? `<div class="kv"><span class="k">云端数据</span><span class="v">${remoteState.chains.length} 链 · ${remoteState.wins.length} 喜报 · ${remoteState.precedents.length} 判例</span></div>`
+          : ''
+      }
+      <div class="kv"><span class="k">本机设备</span><span class="v" style="font-size:11px">${esc(G.deviceId())}</span></div>
+      ${
+        syncState.phase === 'error'
+          ? `<div class="kv"><span class="k">上次错误</span><span class="v" style="font-size:11px;color:var(--rust)">${esc(syncState.err)}</span></div>`
+          : ''
+      }
       ${actions}
       <div class="btnrow"><button class="btn ghost wide" data-act="close">关闭</button></div>`,
   });
@@ -1758,6 +1917,8 @@ function openIntro() {
 /* ---------------- 事件 ---------------- */
 
 function afterChange() {
+  // core 的 _commit 已经存过；这里再 touch 一次，兜住那些直接改 st 的操作
+  led.touch();
   render();
   autoSyncSoon();
 }
@@ -1932,7 +2093,7 @@ function onClick(e) {
       break;
     case 'ch-delete-go': {
       cancelChainSounds(id);
-      st.chains = st.chains.filter((c) => c.id !== id);
+      led.deleteChain(id);
       closeSheet();
       afterChange();
       toast('已删除');
@@ -2062,8 +2223,7 @@ function onClick(e) {
       break;
     }
     case 'p-delete-go': {
-      const ids = [id, ...C.descendantIds(st, id)];
-      st.policies = st.policies.filter((p) => !ids.includes(p.id));
+      led.deletePolicy(id);
       closeSheet();
       afterChange();
       toast('已删除');
@@ -2209,120 +2369,96 @@ function onClick(e) {
     case 'sync-open':
       openSync();
       break;
+    case 'sync-now':
+    case 'sync-pull':
+    case 'sync-push':
+    case 'sync-merge':
+    case 'sync-conflict':
+      closeSheet();
+      syncNow({ manual: true });
+      break;
     case 'sync-diag':
       closeSheet();
       setTimeout(syncDiag, 120);
       break;
-    case 'sync-conflict':
-      openConflict();
-      break;
-    case 'sync-merge': {
-      closeSheet();
-      (async () => {
-        try {
-          const remote = await G.pull(syncCfg);
-          if (!remote) return toast('云端没有文件');
-          mergeRemote(remote.text);
-          const ok = await doPush({ force: true });
-          if (ok) {
-            syncConflict = false;
-            render();
-            toast('已合并并上传');
-          }
-        } catch (e) {
-          toast(e.message || '合并失败');
-        }
-      })();
-      break;
-    }
     case 'sync-save': {
-      const cfg = {
-        repo: $('#sy-repo').value.trim().replace(/^https?:\/\/github\.com\//, '').replace(/\.git$/, ''),
-        path: $('#sy-path').value.trim() || 'ledger/state.json',
-        branch: $('#sy-branch').value.trim() || 'main',
-        token: $('#sy-token').value.trim(),
-      };
-      G.saveCfg(cfg);
-      syncCfg = G.loadCfg();
-      syncConflict = false;
+      const cfg = readSyncForm();
+      if (!cfg.repo || !cfg.token) return toast('仓库和令牌都要填');
+      adoptSyncCfg(cfg);
       closeSheet();
-      afterChange();
-      toast('已保存到本机');
+      render();
+      toast('已保存，开始同步…');
+      syncNow({ manual: true });
       break;
     }
     case 'sync-test': {
-      const cfg = {
-        repo: $('#sy-repo').value.trim().replace(/^https?:\/\/github\.com\//, '').replace(/\.git$/, ''),
-        path: $('#sy-path').value.trim() || 'ledger/state.json',
-        branch: $('#sy-branch').value.trim() || 'main',
-        token: $('#sy-token').value.trim(),
-      };
+      const cfg = readSyncForm();
       if (!cfg.repo || !cfg.token) return toast('仓库和令牌都要填');
       toast('测试中…');
       G.test(cfg)
         .then((r) => {
-          G.saveCfg(cfg);
-          syncCfg = G.loadCfg();
+          adoptSyncCfg(cfg);
           toast(`连上了：${r.login} → ${r.repo}${r.private ? '（私有）' : '（公开！账本会被人看到）'}`);
           render();
         })
         .catch((e) => toast(e.message || '连接失败'));
       break;
     }
-    case 'sync-pull':
-      doPull().then((ok) => {
-        if (!ok && isDirty() && G.configured(syncCfg)) {
-          openSheet({
-            title: '本地有未上传的改动',
-            body: `<p class="tip" style="margin-top:0">拉取会用云端覆盖本机。先决定保哪边。</p>
-              <div class="btnrow"><button class="btn primary wide" data-act="sync-pull-force">用云端覆盖本机</button></div>
-              <div class="btnrow"><button class="btn wide" data-act="sync-push-force">改用本机覆盖云端</button></div>
-              <div class="btnrow"><button class="btn ghost wide" data-act="close">先不动</button></div>`,
-          });
-        }
-      });
+    case 'sync-copy-code':
+      copyText(G.encodeCode(syncCfg), '#sy-code');
       break;
-    case 'sync-pull-force':
+    case 'sync-code-open':
       closeSheet();
-      doPull({ silent: false, force: true }).then(() => rescheduleAll());
+      setTimeout(openSyncCode, 120);
       break;
-    case 'sync-push':
-    case 'sync-push-force':
-      closeSheet();
-      doPush().then((ok) => {
-        if (!ok && syncConflict) {
-          openSheet({
-            title: '云端已经变了',
-            body: `<p class="tip" style="margin-top:0">这台设备和别处都改过账本。GitHub 上每次上传都是一个 commit，覆盖了也能回滚。</p>
-              <div class="btnrow"><button class="btn primary wide" data-act="sync-force-overwrite">用本机覆盖云端</button></div>
-              <div class="btnrow"><button class="btn wide" data-act="sync-pull-force">用云端覆盖本机</button></div>
-              <div class="btnrow"><button class="btn ghost wide" data-act="close">先不动</button></div>`,
-          });
-        }
-      });
-      break;
-    case 'sync-force-overwrite': {
-      closeSheet();
-      (async () => {
-        try {
-          const remote = await G.pull(syncCfg);
-          const res = await G.push(syncCfg, JSON.stringify(st), remote ? remote.sha : null, '账本（强制覆盖）');
-          if (res.conflict) throw new Error('还是冲突，稍后再试');
-          markSynced(res.sha);
-          syncConflict = false;
-          render();
-          toast('已覆盖云端');
-        } catch (e) {
-          toast(e.message || '覆盖失败');
-        }
-      })();
+    case 'sync-code-apply': {
+      const code = $('#sy-code-in').value.trim();
+      try {
+        const cfg = G.decodeCode(code);
+        adoptSyncCfg(cfg);
+        closeSheet();
+        render();
+        toast('同步码已应用，开始同步…');
+        syncNow({ manual: true });
+      } catch (e) {
+        toast('同步码无效');
+      }
       break;
     }
+    case 'sync-pull-force':
+      openSheet({
+        title: '用云端覆盖本机？',
+        body: `<p class="tip" style="margin-top:0">这会丢掉本机尚未上传的改动（会先在本机留一份快照）。正常自动同步不需要这个。</p>
+          <div class="btnrow"><button class="btn danger wide" data-act="sync-pull-go">确定用云端覆盖本机</button></div>
+          <div class="btnrow"><button class="btn ghost wide" data-act="close">取消</button></div>`,
+      });
+      break;
+    case 'sync-pull-go':
+      closeSheet();
+      forcePull({});
+      break;
+    case 'sync-push-force':
+      openSheet({
+        title: '用本机覆盖云端？',
+        body: `<p class="tip" style="margin-top:0">这会用本机账本覆盖云端文件（GitHub 上仍能从历史回滚）。正常自动同步不需要这个。</p>
+          <div class="btnrow"><button class="btn danger wide" data-act="sync-push-go">确定用本机覆盖云端</button></div>
+          <div class="btnrow"><button class="btn ghost wide" data-act="close">取消</button></div>`,
+      });
+      break;
+    case 'sync-push-go':
+      closeSheet();
+      forcePush({});
+      break;
     case 'sync-forget':
       G.saveCfg({ ...G.DEF });
       syncCfg = G.loadCfg();
+      st.sync = { sha: null, at: 0, rev: 0, digest: '' };
+      led.save();
+      syncState.phase = 'off';
+      syncState.err = '';
+      syncState.action = '';
       closeSheet();
-      afterChange();
+      render();
       toast('已断开（账本不动）');
       break;
     case 'intro':
@@ -2347,9 +2483,22 @@ window.__app = {
   state: () => led.state,
   sound: S,
   sync: G,
+  merge: M,
   syncNow,
+  forcePull,
+  forcePush,
   syncLine,
+  syncInfo: () => ({ ...syncInfo(), phase: syncState.phase, err: syncState.err, step: syncState.step, busy: syncBusy }),
   isDirty,
+  // 调试 / 测试入口：不开弹层也能写一条事件
+  commit: (type, payload) => {
+    led._commit(type || 'debug', payload || {});
+    afterChange();
+  },
+  deletePolicy: (id) => {
+    led.deletePolicy(id);
+    afterChange();
+  },
 };
 
 /* ---------------- 启动 ---------------- */
@@ -2366,9 +2515,6 @@ if (!st.seen) {
 
 const hashApplied = applySyncHash();
 if (!hashApplied) bootSync();
-setTimeout(() => {
-  if (G.configured(syncCfg)) autoSyncSoon();
-}, 3000);
 
 if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
   window.addEventListener('load', () => {
