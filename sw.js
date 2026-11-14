@@ -1,7 +1,7 @@
 /* 离线缓存：网络优先，断了才用缓存。
    之前的 cache-first 会把旧 JS 一直喂给浏览器，界面看起来“退版本”。 */
 
-const CACHE = 'ctdp-v5';
+const CACHE = 'ctdp-v6';
 const ASSETS = [
   './',
   './index.html',

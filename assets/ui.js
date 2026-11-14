@@ -8,7 +8,7 @@ import * as S from './sound.js';
 import * as G from './sync.js';
 import * as M from './merge.js';
 
-const APP_VERSION = '0.5.0';
+const APP_VERSION = '0.5.1';
 
 /* ---------------- 元素 ---------------- */
 const $ = (s, r = document) => r.querySelector(s);
@@ -70,29 +70,30 @@ document.addEventListener(
   { once: true, capture: true }
 );
 
-/** 给某条链排好提示音：结链一声，预约到点一串 */
+/** 给某条链排好提示音：剩 30 秒一声，正式到点一声 */
 function scheduleChainSound(id) {
   const c = C.chainById(st, id);
   if (!c) return;
-  S.cancel('ch:' + id);
-  S.cancel('aux:' + id);
-  S.cancel('aux2:' + id);
+  cancelChainSounds(id);
   if (!st.settings.sound) return;
   const now = Date.now();
+
   if (c.running) {
-    S.schedule('done', (c.minutes * 60000 - (now - c.running.start)) / 1000, 'ch:' + id);
+    const left = c.minutes * 60000 - (now - c.running.start);
+    if (left > 30500) S.schedule('warn', (left - 30000) / 1000, 'ch2:' + id);
+    if (left > -60000) S.schedule('done', Math.max(0, left) / 1000, 'ch:' + id);
   }
+
   if (c.aux) {
     const left = c.aux.dueAt - now;
-    if (left > 0) {
-      if (c.aux.second && c.auxSignal2) S.schedule('tick', (left - 30000) / 1000, 'aux2:' + id);
-      S.schedule('due', left / 1000, 'aux:' + id);
-    }
+    if (left > 30500) S.schedule('warn', (left - 30000) / 1000, 'aux2:' + id);
+    if (left > -60000) S.schedule('due', Math.max(0, left) / 1000, 'aux:' + id);
   }
 }
 
 function cancelChainSounds(id) {
   S.cancel('ch:' + id);
+  S.cancel('ch2:' + id);
   S.cancel('aux:' + id);
   S.cancel('aux2:' + id);
 }
@@ -100,6 +101,26 @@ function cancelChainSounds(id) {
 function rescheduleAll() {
   for (const c of st.chains) scheduleChainSound(c.id);
 }
+
+/* 从后台回来、或任何一次点击，都把音频上下文叫醒并重新对时。
+   手机浏览器可能在切后台时挂起 AudioContext，不 resume 的话排好的音会哑。 */
+document.addEventListener(
+  'pointerdown',
+  () => {
+    S.resume();
+  },
+  { passive: true }
+);
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') {
+    S.resume();
+    rescheduleAll();
+  }
+});
+window.addEventListener('pageshow', () => {
+  S.resume();
+  rescheduleAll();
+});
 
 /* ---------------- 云同步 ---------------- */
 
@@ -625,7 +646,11 @@ function chainCard(c, now) {
         ${segs(c.nodes.length)}
         <div class="btnrow">
           <button class="btn primary" id="done-${c.id}" data-act="complete" data-id="${c.id}">完成</button>
+          <button class="btn" data-act="judge" data-id="${c.id}">判定</button>
           <button class="btn danger" data-act="interrupt" data-id="${c.id}">中断</button>
+        </div>
+        <div class="btnrow" style="margin-top:6px">
+          <button class="btn ghost wide" data-act="chmenu" data-id="${c.id}">编辑 / 设置这条链</button>
         </div>
       </div>
     </article>`;
@@ -1103,20 +1128,37 @@ function afterRender() {
 
 /* ---------------- 计时器 ---------------- */
 
+const warned = new Set();
+
 function tick() {
   if (ui.tab !== 'chains') return;
   const now = Date.now();
   for (const c of st.chains) {
     if (c.running) {
       const el = now - c.running.start;
+      const left = c.minutes * 60000 - el;
       const node = document.querySelector(`[data-clock="${c.id}"]`);
       if (node) {
         node.textContent = C.fmtClock(el);
-        node.classList.toggle('done', el >= c.minutes * 60000);
+        node.classList.toggle('done', left <= 0);
+      }
+      const key = `${c.id}:${c.running.start}`;
+      if (left <= 30000 && left > 0 && !warned.has(key + ':30')) {
+        warned.add(key + ':30');
+        toast(`还剩 30 秒 · ${c.name}`);
+      }
+      if (left <= 0 && !warned.has(key + ':0')) {
+        warned.add(key + ':0');
+        toast(`时间到 · ${c.name}，可以结了`);
       }
     }
     if (c.aux) {
       const left = c.aux.dueAt - now;
+      const akey = `aux:${c.id}:${c.aux.armedAt || c.aux.dueAt}`;
+      if (left <= 30000 && left > 0 && !warned.has(akey + ':30')) {
+        warned.add(akey + ':30');
+        toast('预约还剩 30 秒');
+      }
       // 二次信号：剩 30 秒时把提示切到「即时启动信号」
       if (left <= 30000 && left > 0 && c.aux.second && !c.aux.stage2) {
         c.aux.stage2 = true;
@@ -1140,6 +1182,7 @@ function tick() {
       }
     }
   }
+  if (warned.size > 100) warned.clear();
 }
 setInterval(tick, 1000);
 
@@ -1177,10 +1220,12 @@ function openComplete(id) {
   const el = Date.now() - c.running.start;
   const target = c.minutes * 60000;
   if (el >= target) {
+    cancelChainSounds(id);
     const r = led.complete(id);
     if (r.ok) {
       closeSheet();
       render();
+      S.chime('done'); // 到点手动结链也响一声；排程的那声已被取消，不会双响
       toast(`第 #${r.n} 节入档`);
     }
     return;
@@ -1223,9 +1268,14 @@ function openJudge(chainId, preset = '') {
   if (!c) return;
   const chips = ['看手机', '回微信', '刷视频', '离开座位', '接电话', '走神', '做别的事'];
   openSheet({
-    title: `判定 · ${c.name}`,
+    title: `判定 · ${c.name}${c.running ? ' · 进行中' : ''}`,
     body: `
       <p class="tip" style="margin-top:0">两选一，没有第三种。</p>
+      ${
+        c.running
+          ? `<p class="tip" style="color:var(--brass);border-color:var(--brass-dim)">这一节还在计时。判「允许」不影响计时；判「失败」会清零并结束这一节。</p>`
+          : ''
+      }
       <div class="chips">${chips
         .map((x) => `<button class="chip" data-act="chip" data-v="${x}">${x}</button>`)
         .join('')}</div>
@@ -1269,7 +1319,7 @@ function confirmDeny(chainId, behavior) {
       <div class="btnrow">
         <button class="btn danger wide" data-act="judge-deny-go" data-id="${chainId}" data-v="${esc(behavior)}">确认清零</button>
       </div>
-      <div class="btnrow"><button class="btn ghost wide" data-act="close">撤回</button></div>`,
+      <div class="btnrow"><button class="btn ghost wide" data-act="judge-edit" data-id="${chainId}" data-v="${esc(behavior)}">返回修改</button></div>`,
   });
 }
 
@@ -1282,7 +1332,7 @@ function confirmAllow(chainId, behavior) {
       <div class="btnrow">
         <button class="btn primary wide" data-act="judge-allow-go" data-id="${chainId}" data-v="${esc(behavior)}">确认永久放行</button>
       </div>
-      <div class="btnrow"><button class="btn ghost wide" data-act="close">撤回</button></div>`,
+      <div class="btnrow"><button class="btn ghost wide" data-act="judge-edit" data-id="${chainId}" data-v="${esc(behavior)}">返回修改</button></div>`,
   });
 }
 
@@ -1711,10 +1761,14 @@ function openSettings() {
       </label>
       <label class="check-row">
         <input type="checkbox" id="se-sound" ${st.settings.sound ? 'checked' : ''}>
-        <span class="txt">到点提示音<span class="sub"> · 结链、预约到点</span></span>
+        <span class="txt">到点提示音<span class="sub"> · 剩 30 秒一声、正式到点一声</span></span>
       </label>
       <div class="btnrow" style="margin-top:6px">
-        <button class="btn ghost wide" data-act="sound-test">试听提示音</button>
+        <button class="btn" data-act="sound-test" data-v="warn">试听 30 秒</button>
+        <button class="btn" data-act="sound-test" data-v="done">试听结链</button>
+      </div>
+      <div class="btnrow">
+        <button class="btn ghost wide" data-act="sound-test" data-v="due">试听到点（最急）</button>
       </div>
       <div class="btnrow"><button class="btn primary wide" data-act="settings-save">保存</button></div>`,
   });
@@ -1988,7 +2042,10 @@ function onClick(e) {
       const r = led.complete(id, { force: true });
       closeSheet();
       afterChange();
-      if (r.ok) toast(`第 #${r.n} 节入档（未满时长）`);
+      if (r.ok) {
+        S.chime('done');
+        toast(`第 #${r.n} 节入档（未满时长）`);
+      }
       break;
     }
     case 'interrupt': {
@@ -2002,6 +2059,9 @@ function onClick(e) {
     }
     case 'judge':
       openJudge(id);
+      break;
+    case 'judge-edit':
+      openJudge(id, v || '');
       break;
     case 'chip': {
       const input = $('#jb');
@@ -2025,10 +2085,11 @@ function onClick(e) {
       break;
     }
     case 'judge-allow-go': {
-      cancelChainSounds(id);
+      // 允许不打断这一节：不要取消 ch/ch2，重新排一次，保证到点还会响
       led.judge({ chainId: id, behavior: v, decision: 'allow' });
       closeSheet();
       afterChange();
+      scheduleChainSound(id);
       toast('已立判例 · 永久放行');
       break;
     }
@@ -2065,6 +2126,7 @@ function onClick(e) {
       });
       closeSheet();
       afterChange();
+      scheduleChainSound(id);
       toast('已保存');
       break;
     }
@@ -2339,15 +2401,21 @@ function onClick(e) {
       led._commit('settings.update', { ...st.settings });
       closeSheet();
       afterChange();
-      rescheduleAll();
+      if (!st.settings.sound) S.cancelAll();
+      else rescheduleAll();
       toast('已保存');
       break;
     }
-    case 'sound-test':
+    case 'sound-test': {
       S.unlock();
-      S.chime('done');
-      toast(S.ready() ? '这是结链的提示音' : '浏览器还没解锁音频，先点一下页面');
+      const kind = v || 'done';
+      setTimeout(() => {
+        S.chime(kind);
+        const label = kind === 'due' ? '到点' : kind === 'warn' ? '剩 30 秒' : '结链';
+        toast(S.ready() ? `这是${label}提示音` : '浏览器还没解锁音频，先点一下页面');
+      }, 100);
       break;
+    }
     case 'force-update': {
       (async () => {
         try {
