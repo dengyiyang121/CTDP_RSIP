@@ -13,7 +13,7 @@
 > 本仓库是独立实现，不含原文内容。
 
 **状态（2026-11-14）**：版本 `0.5.0` · 线上 https://dengyiyang121.github.io/CTDP_RSIP/
-接手的 agent 请先读 **[HANDOFF.md](HANDOFF.md)**（含现状、代码地图、同步设计、未解决问题、环境坑）。
+部署与两台设备同步的步骤见 **[DEPLOY.md](DEPLOY.md)**。
 
 ---
 
@@ -124,7 +124,7 @@ assets/
 test/
   core.test.mjs       16 项逻辑测试（node）
   tree.test.mjs       12 项布局测试（node）
-  sync.test.mjs       21 项合并/指纹测试（node）
+  sync.test.mjs       22 项合并/指纹测试（node）
   sync.e2e.mjs        双设备自动同步（真浏览器 + 假 GitHub API）
   smoke.mjs           Playwright 走完主流程 + 截图
 tools/make-icons.py   生成图标

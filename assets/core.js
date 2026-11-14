@@ -268,7 +268,17 @@ export class Ledger {
     const prev = this.state.events[this.state.events.length - 1];
     ev.h = fnv1a((prev ? prev.h : '00000000') + JSON.stringify({ ...ev, h: undefined }));
     this.state.events.push(ev);
-    if (this.state.events.length > 20000) this.state.events.splice(0, 2000);
+    if (this.state.events.length > 20000) {
+      // 裁掉最老的 2000 条后必须重算序号/哈希，否则 verify() 会误报“账本被改过”
+      this.state.events.splice(0, 2000);
+      let prevHash = '00000000';
+      for (let i = 0; i < this.state.events.length; i++) {
+        const e = this.state.events[i];
+        e.seq = i + 1;
+        e.h = fnv1a(prevHash + JSON.stringify({ ...e, h: undefined }));
+        prevHash = e.h;
+      }
+    }
     return ev;
   }
 

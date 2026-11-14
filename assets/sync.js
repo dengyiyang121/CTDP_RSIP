@@ -273,7 +273,13 @@ export async function push(cfg, text, sha, message) {
     } catch (e) {
       /* ignore */
     }
-    return { conflict: true, status: res.status, detail };
+    // 422 不全是“冲突”：sha 没带/对不上可以重拉重试，分支不存在/文件过大必须立刻报错
+    const retryable = res.status === 409 || !detail || /sha|already exists|does not match/i.test(detail);
+    if (retryable) return { conflict: true, status: res.status, detail };
+    if (/branch.*not found/i.test(detail)) {
+      throw new SyncError(`分支 ${cfg.branch} 不存在。去设置里把「分支」改成仓库的默认分支。`, { status: 422, detail });
+    }
+    throw new SyncError(`云端拒绝了这次写入（422）${detail ? ' · ' + detail : ''}`, { status: 422, detail });
   }
   if (!res.ok) throw await reason(res);
   const j = await res.json();
