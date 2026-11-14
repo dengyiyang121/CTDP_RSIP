@@ -22,15 +22,15 @@ function ensure() {
   ctx = new AC();
 
   master = ctx.createGain();
-  master.gain.value = 0.9;
+  master.gain.value = 0.95;
 
-  // 方波叠起来容易削波；压缩器让“响”不等于“破”
+  // 方波叠起来容易削波；阈值放在 -6 dB，只削峰，不把整体音量压小
   const comp = ctx.createDynamicsCompressor();
-  comp.threshold.value = -14;
+  comp.threshold.value = -6;
   comp.knee.value = 0;
-  comp.ratio.value = 20;
+  comp.ratio.value = 12;
   comp.attack.value = 0.003;
-  comp.release.value = 0.25;
+  comp.release.value = 0.2;
 
   master.connect(comp);
   comp.connect(ctx.destination);
